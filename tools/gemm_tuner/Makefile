@@ -1,33 +1,149 @@
-# === 설정 ===
-NDK_PATH ?= $(ANDROID_NDK)
-TOOLCHAIN := $(NDK_PATH)/toolchains/llvm/prebuilt/linux-x86_64
+# Android NDK OpenCL GEMM Tuner Makefile
+# 사용법: make [TARGET=arm64-v8a|armeabi-v7a|x86|x86_64]
 
-ifeq ($(NDK_PATH),)
-	$(error NDK_PATH is not set)
+# 기본 설정
+TARGET ?= arm64-v8a
+ANDROID_NDK ?= $(ANDROID_NDK_HOME)
+ANDROID_API ?= 24
+
+# NDK 경로 확인
+ifeq ($(ANDROID_NDK),)
+    $(error ANDROID_NDK_HOME 환경변수를 설정하거나 ANDROID_NDK를 지정하세요)
 endif
 
-TARGET := aarch64-linux-android
-API_LEVEL := 24
-CXX := $(TOOLCHAIN)/bin/$(TARGET)$(API_LEVEL)-clang++
+# 툴체인 설정
+TOOLCHAIN := $(ANDROID_NDK)/toolchains/llvm/prebuilt/linux-x86_64
 SYSROOT := $(TOOLCHAIN)/sysroot
 
-# === 파일 설정 ===
-SRC := main.cpp
-OUT := main
-OBJ_DIR := obj
-BIN_DIR := bin
+# 아키텍처별 설정
+ifeq ($(TARGET),arm64-v8a)
+    ARCH := aarch64
+    ABI := arm64-v8a
+    TRIPLE := aarch64-linux-android
+else ifeq ($(TARGET),armeabi-v7a)
+    ARCH := arm
+    ABI := armeabi-v7a
+    TRIPLE := armv7a-linux-androideabi
+else ifeq ($(TARGET),x86)
+    ARCH := x86
+    ABI := x86
+    TRIPLE := i686-linux-android
+else ifeq ($(TARGET),x86_64)
+    ARCH := x86_64
+    ABI := x86_64
+    TRIPLE := x86_64-linux-android
+else
+    $(error 지원하지 않는 TARGET: $(TARGET))
+endif
 
-CFLAGS := -O2 --target=$(TARGET) --sysroot=$(SYSROOT) -fPIE -fPIC
-LDFLAGS := -pie -llog -lOpenCL
+# 컴파일러 설정
+CC := $(TOOLCHAIN)/bin/$(TRIPLE)$(ANDROID_API)-clang
+CXX := $(TOOLCHAIN)/bin/$(TRIPLE)$(ANDROID_API)-clang++
+AR := $(TOOLCHAIN)/bin/llvm-ar
+STRIP := $(TOOLCHAIN)/bin/llvm-strip
 
-# === 타겟 ===
-all: $(BIN_DIR)/$(OUT)
+# 소스 파일들
+SOURCES := main.cpp
+HEADERS := gemm_kernel.h
+OBJECTS := $(SOURCES:.cpp=.o)
 
-$(BIN_DIR)/$(OUT): $(SRC)
-	mkdir -p $(BIN_DIR)
-	$(CXX) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# 실행 파일명
+TARGET_BIN := gemm_tuner_$(TARGET)
 
+# 컴파일러 플래그
+CXXFLAGS := -std=c++14 -fPIC -Wall -Wextra -O2
+CXXFLAGS += -I$(SYSROOT)/usr/include
+CXXFLAGS += -I$(SYSROOT)/usr/include/$(TRIPLE)
+CXXFLAGS += -DANDROID -D__ANDROID_API__=$(ANDROID_API)
+CXXFLAGS += -Wno-deprecated-declarations
+CXXFLAGS += -static-libstdc++
+
+# 링커 플래그
+LDFLAGS := -L$(SYSROOT)/usr/lib/$(ABI)
+LDFLAGS += -lOpenCL -llog -landroid
+LDFLAGS += -Wl,--allow-shlib-undefined
+LDFLAGS += -static-libstdc++
+
+# 기본 타겟
+all: $(TARGET_BIN)
+
+# 헤더 파일 생성
+general_gemm.h: general_gemm.cl
+	@echo "🔧 general_gemm.cl을 헤더 파일로 변환 중..."
+	@python3 cl_to_header.py general_gemm.cl general_gemm.h
+
+# 모든 헤더 파일 생성
+headers: general_gemm.h
+
+# 오브젝트 파일 컴파일
+%.o: %.cpp headers
+	@echo "🔨 컴파일 중: $<"
+	@$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# 실행 파일 링크
+$(TARGET_BIN): $(OBJECTS)
+	@echo "🔗 링크 중: $@"
+	@$(CXX) $(OBJECTS) -o $@ $(LDFLAGS)
+	@echo "✅ 빌드 완료: $@"
+
+# 모든 아키텍처 빌드
+build-all:
+	@echo "🏗️ 모든 아키텍처 빌드 중..."
+	@$(MAKE) TARGET=arm64-v8a
+	@$(MAKE) TARGET=armeabi-v7a
+	@$(MAKE) TARGET=x86
+	@$(MAKE) TARGET=x86_64
+	@echo "✅ 모든 아키텍처 빌드 완료"
+
+# 정리
 clean:
-	rm -rf $(BIN_DIR)
+	@echo "🧹 정리 중..."
+	@rm -f *.o gemm_tuner_* *_kernel.h
+	@echo "✅ 정리 완료"
 
-.PHONY: all clean
+# 설치 (ADB를 통한 디바이스 설치)
+install: $(TARGET_BIN)
+	@echo "📱 디바이스에 설치 중..."
+	@adb push $(TARGET_BIN) /data/local/tmp/
+	@adb shell chmod +x /data/local/tmp/$(TARGET_BIN)
+	@echo "✅ 설치 완료: /data/local/tmp/$(TARGET_BIN)"
+
+# 실행 (ADB를 통한 디바이스 실행)
+run: install
+	@echo "🚀 디바이스에서 실행 중..."
+	@adb shell /data/local/tmp/$(TARGET_BIN) $(M) $(N) $(K)
+
+# 매트릭스 크기 설정 (기본값)
+M ?= 1024
+N ?= 1024
+K ?= 1024
+
+# 디버그 정보 출력
+debug-info:
+	@echo "🔍 빌드 정보:"
+	@echo "  TARGET: $(TARGET)"
+	@echo "  ARCH: $(ARCH)"
+	@echo "  ABI: $(ABI)"
+	@echo "  TRIPLE: $(TRIPLE)"
+	@echo "  ANDROID_API: $(ANDROID_API)"
+	@echo "  CC: $(CC)"
+	@echo "  CXX: $(CXX)"
+	@echo "  SYSROOT: $(SYSROOT)"
+
+# 도움말
+help:
+	@echo "📖 사용법:"
+	@echo "  make                    # 기본 빌드 (arm64-v8a)"
+	@echo "  make TARGET=arm64-v8a   # ARM64 빌드"
+	@echo "  make TARGET=armeabi-v7a # ARM32 빌드"
+	@echo "  make TARGET=x86         # x86 빌드"
+	@echo "  make TARGET=x86_64      # x86_64 빌드"
+	@echo "  make build-all          # 모든 아키텍처 빌드"
+	@echo "  make install            # 디바이스에 설치"
+	@echo "  make run                # 디바이스에서 실행 (기본 크기: 1024x1024x1024)"
+	@echo "  make run M=512 N=1024 K=2048  # 특정 크기로 실행"
+	@echo "  make clean              # 정리"
+	@echo "  make debug-info         # 빌드 정보 출력"
+
+# 의존성
+.PHONY: all build-all clean install run debug-info help 
