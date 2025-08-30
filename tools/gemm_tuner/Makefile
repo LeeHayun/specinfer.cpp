@@ -44,7 +44,6 @@ STRIP := $(TOOLCHAIN)/bin/llvm-strip
 
 # 소스 파일들
 SOURCES := main.cpp
-HEADERS := gemm_kernel.h
 OBJECTS := $(SOURCES:.cpp=.o)
 
 # 실행 파일명
@@ -72,8 +71,13 @@ general_gemm.h: general_gemm.cl
 	@echo "🔧 general_gemm.cl을 헤더 파일로 변환 중..."
 	@python3 cl_to_header.py general_gemm.cl general_gemm.h
 
+splitk_gemm.h: splitk_gemm.cl
+	@echo "🔧 splitk_gemm.cl을 헤더 파일로 변환 중..."
+	@python3 cl_to_header.py splitk_gemm.cl splitk_gemm.h
+
 # 모든 헤더 파일 생성
-headers: general_gemm.h
+# headers: general_gemm.h splitk_gemm.h
+headers: splitk_gemm.h
 
 # 오브젝트 파일 컴파일
 %.o: %.cpp headers

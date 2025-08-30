@@ -8,7 +8,8 @@
 #include <iomanip>
 #include <memory>
 #include <cstring>
-#include "general_gemm.h"
+// #include "general_gemm.h"
+#include "splitk_gemm.h"
 #include "half.hpp"
 
 
@@ -70,7 +71,7 @@ public:
 
         p = clCreateProgramWithSource(ctx, 1, (const char**)&program_buffer, &program_size, &err);
         if(err < 0) {
-            std::cerr << "OpenCL error creating program" << std::endl;
+            std::cerr << "OpenCL error creating program(" << err << ")" << std::endl;
             exit(1);
         }
 
@@ -80,7 +81,7 @@ public:
             program_log = (char*) malloc(log_size + 1);
             program_log[log_size] = '\0';
             clGetProgramBuildInfo(p, dev, CL_PROGRAM_BUILD_LOG, log_size + 1, program_log, NULL);
-            std::cerr << "OpenCL error creating program:\n\n" << program_log << std::endl;
+            std::cerr << "OpenCL error creating program(" << err << "):\n\n" << program_log << std::endl;
             free(program_log);
             exit(1);
         }
@@ -177,21 +178,56 @@ public:
         cl_int err;
         
         // 커널 인자 설정 (gemm_c4nhw4_to_nhwc용)
+        // err = clSetKernelArg(kernel, 0, sizeof(cl_mem), &weight_buffer);
+        // CHECK_CL_ERROR(err);
+        // err = clSetKernelArg(kernel, 1, sizeof(cl_mem), &scale_buffer);
+        // CHECK_CL_ERROR(err);
+        // err = clSetKernelArg(kernel, 2, sizeof(cl_mem), &input_image);
+        // CHECK_CL_ERROR(err);
+        // err = clSetKernelArg(kernel, 3, sizeof(cl_mem), &output_buffer);
+        // CHECK_CL_ERROR(err);
+        // err = clSetKernelArg(kernel, 4, sizeof(int), &M);
+        // CHECK_CL_ERROR(err);
+        // err = clSetKernelArg(kernel, 5, sizeof(int), &N_padding);
+        // CHECK_CL_ERROR(err);
+        // err = clSetKernelArg(kernel, 6, sizeof(int), &K);
+        // CHECK_CL_ERROR(err);
+        // err = clSetKernelArg(kernel, 7, sizeof(int), &N_no_padding);
+        // CHECK_CL_ERROR(err);
+
+        unsigned long offset1 = 0;
+        unsigned long offsetd = 0;
+        int one = 1;
+        
         err = clSetKernelArg(kernel, 0, sizeof(cl_mem), &weight_buffer);
         CHECK_CL_ERROR(err);
         err = clSetKernelArg(kernel, 1, sizeof(cl_mem), &scale_buffer);
         CHECK_CL_ERROR(err);
         err = clSetKernelArg(kernel, 2, sizeof(cl_mem), &input_image);
         CHECK_CL_ERROR(err);
-        err = clSetKernelArg(kernel, 3, sizeof(cl_mem), &output_buffer);
+        err = clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offset1);
         CHECK_CL_ERROR(err);
-        err = clSetKernelArg(kernel, 4, sizeof(int), &M);
+        err = clSetKernelArg(kernel, 4, sizeof(cl_mem), &output_buffer);
         CHECK_CL_ERROR(err);
-        err = clSetKernelArg(kernel, 5, sizeof(int), &N_padding);
+        err = clSetKernelArg(kernel, 5, sizeof(cl_ulong), &offsetd);
         CHECK_CL_ERROR(err);
         err = clSetKernelArg(kernel, 6, sizeof(int), &K);
         CHECK_CL_ERROR(err);
-        err = clSetKernelArg(kernel, 7, sizeof(int), &N_no_padding);
+        err = clSetKernelArg(kernel, 7, sizeof(int), &M);
+        CHECK_CL_ERROR(err);
+        err = clSetKernelArg(kernel, 8, sizeof(int), &one);
+        CHECK_CL_ERROR(err);
+        err = clSetKernelArg(kernel, 9, sizeof(int), &K);
+        CHECK_CL_ERROR(err);
+        err = clSetKernelArg(kernel, 10, sizeof(int), &one);
+        CHECK_CL_ERROR(err);
+        err = clSetKernelArg(kernel, 11, sizeof(int), &M);
+        CHECK_CL_ERROR(err);
+        err = clSetKernelArg(kernel, 12, sizeof(int), &N_no_padding);
+        CHECK_CL_ERROR(err);
+        err = clSetKernelArg(kernel, 13, sizeof(int), &one);
+        CHECK_CL_ERROR(err);
+        err = clSetKernelArg(kernel, 14, sizeof(int), &one);
         CHECK_CL_ERROR(err);
         
         // 이벤트 생성
@@ -204,6 +240,7 @@ public:
         // 완료 대기
         err = clWaitForEvents(1, &event);
         CHECK_CL_ERROR(err);
+        
         
         // 실행 시간 측정
         cl_ulong start_time, end_time;
@@ -242,83 +279,160 @@ public:
         double best_gflops = 0.0;
         size_t count = 0;
 
-        for (size_t TILE_M = 2; TILE_M <= std::max(M, 16); TILE_M *= 2) {
-            for (size_t TILE_K = 1; TILE_K <= std::max(K, 32); TILE_K *= 2) {
-                size_t weight_tile_size = TILE_M * TILE_K;
-                if (weight_tile_size < 16 || weight_tile_size > 64) {
-                    continue;
-                }
-                for (size_t TILE_N = 1; TILE_N <= std::max(N, 8); TILE_N *= 2) {
-                    for (size_t WG_N = 1; WG_N <= N / TILE_N; WG_N *= 2) {
-                        for (size_t WG_M = 1; WG_M <= M / TILE_M; WG_M *= 2) {
-                            for (size_t WI_N = 1; WI_N <= N / (WG_N * TILE_N); WI_N *= 2) {
-                                for (size_t WI_M = 1; WI_M <= M / (WG_M * TILE_M); WI_M *= 2) {
-                                    for (size_t WI_K = 1; WI_K <= K / TILE_K; WI_K *= 2) {
-                                        size_t num_thread_per_group = WI_N * WI_M * WI_K;
-                                        size_t total_thread = num_thread_per_group * WG_N * WG_M;
-                                        if (total_thread < 1024 || num_thread_per_group < 64 || num_thread_per_group > 1024) {
-                                            continue;
-                                        }
-                                        count += 1;
-                                        continue;
-                                        size_t N_ITER = N / (WG_N * WI_N * TILE_N);
-                                        size_t M_ITER = M / (WG_M * WI_M * TILE_M);
-                                        size_t K_ITER = K / (WI_K * TILE_K);
-                                        std::cout << "TILE_N: " << TILE_N << ", TILE_M: " << TILE_M << ", TILE_K: " << TILE_K << ", WG_N: " << WG_N << ", WG_M: " << WG_M << ", WI_N: " << WI_N << ", WI_M: " << WI_M << ", WI_K: " << WI_K << std::endl;
-                                        std::cout << "N_ITER: " << N_ITER << ", M_ITER: " << M_ITER << ", K_ITER: " << K_ITER << std::endl;
+        // for (size_t TILE_M = 2; TILE_M <= std::max(M, 16); TILE_M *= 2) {
+        //     for (size_t TILE_K = 1; TILE_K <= std::max(K, 32); TILE_K *= 2) {
+        //         size_t weight_tile_size = TILE_M * TILE_K;
+        //         if (weight_tile_size < 16 || weight_tile_size > 64) {
+        //             continue;
+        //         }
+        //         for (size_t TILE_N = 1; TILE_N <= std::max(N, 8); TILE_N *= 2) {
+        //             for (size_t WG_N = 1; WG_N <= N / TILE_N; WG_N *= 2) {
+        //                 for (size_t WG_M = 1; WG_M <= M / TILE_M; WG_M *= 2) {
+        //                     for (size_t WI_N = 1; WI_N <= N / (WG_N * TILE_N); WI_N *= 2) {
+        //                         for (size_t WI_M = 1; WI_M <= M / (WG_M * TILE_M); WI_M *= 2) {
+        //                             for (size_t WI_K = 1; WI_K <= K / TILE_K; WI_K *= 2) {
+        //                                 size_t num_thread_per_group = WI_N * WI_M * WI_K;
+        //                                 size_t total_thread = num_thread_per_group * WG_N * WG_M;
+        //                                 if (total_thread < 1024 || num_thread_per_group < 64 || num_thread_per_group > 1024) {
+        //                                     continue;
+        //                                 }
+        //                                 count += 1;
+        //                                 continue;
+        //                                 size_t N_ITER = N / (WG_N * WI_N * TILE_N);
+        //                                 size_t M_ITER = M / (WG_M * WI_M * TILE_M);
+        //                                 size_t K_ITER = K / (WI_K * TILE_K);
+        //                                 std::cout << "TILE_N: " << TILE_N << ", TILE_M: " << TILE_M << ", TILE_K: " << TILE_K << ", WG_N: " << WG_N << ", WG_M: " << WG_M << ", WI_N: " << WI_N << ", WI_M: " << WI_M << ", WI_K: " << WI_K << std::endl;
+        //                                 std::cout << "N_ITER: " << N_ITER << ", M_ITER: " << M_ITER << ", K_ITER: " << K_ITER << std::endl;
 
-                                        std::string compile_opts = "-cl-mad-enable -cl-unsafe-math-optimizations -cl-finite-math-only -cl-fast-relaxed-math ";
-                                        compile_opts += " -D TILE_N=" + std::to_string(TILE_N);
-                                        compile_opts += " -D TILE_M=" + std::to_string(TILE_M);
-                                        compile_opts += " -D TILE_K=" + std::to_string(TILE_K);
-                                        compile_opts += " -D WG_N=" + std::to_string(WG_N);
-                                        compile_opts += " -D WG_M=" + std::to_string(WG_M);
-                                        compile_opts += " -D WI_N=" + std::to_string(WI_N);
-                                        compile_opts += " -D WI_M=" + std::to_string(WI_M);
-                                        compile_opts += " -D DIM_N=1";
-                                        compile_opts += " -D DIM_M=2";
-                                        compile_opts += " -D DIM_K=0";
-                                        compile_opts += " -D M=" + std::to_string(M);
-                                        compile_opts += " -D N=" + std::to_string(N);
-                                        compile_opts += " -D K=" + std::to_string(K);
-                                        compile_opts += " -D WEIGHT_TILE_SIZE=" + std::to_string(TILE_M * TILE_K);
-                                        compile_opts += " -D TILE_M_x_GLOBAL_M_SIZE=" + std::to_string(TILE_M * WG_M * WI_M);
-                                        compile_opts += " -D TILE_N_x_GLOBAL_N_SIZE=" + std::to_string(TILE_N * WG_N * WI_N);
-                                        compile_opts += " -D GLOBAL_N_SIZE=" + std::to_string(WG_N * WI_N);
-                                        compile_opts += " -D GLOBAL_M_SIZE=" + std::to_string(WG_M * WI_M);
-                                        compile_opts += " -D GLOBAL_K_SIZE=" + std::to_string(WI_K);
+        //                                 std::string compile_opts = "-cl-mad-enable -cl-unsafe-math-optimizations -cl-finite-math-only -cl-fast-relaxed-math ";
+        //                                 compile_opts += " -D TILE_N=" + std::to_string(TILE_N);
+        //                                 compile_opts += " -D TILE_M=" + std::to_string(TILE_M);
+        //                                 compile_opts += " -D TILE_K=" + std::to_string(TILE_K);
+        //                                 compile_opts += " -D WG_N=" + std::to_string(WG_N);
+        //                                 compile_opts += " -D WG_M=" + std::to_string(WG_M);
+        //                                 compile_opts += " -D WI_N=" + std::to_string(WI_N);
+        //                                 compile_opts += " -D WI_M=" + std::to_string(WI_M);
+        //                                 compile_opts += " -D DIM_N=1";
+        //                                 compile_opts += " -D DIM_M=2";
+        //                                 compile_opts += " -D DIM_K=0";
+        //                                 compile_opts += " -D M=" + std::to_string(M);
+        //                                 compile_opts += " -D N=" + std::to_string(N);
+        //                                 compile_opts += " -D K=" + std::to_string(K);
+        //                                 compile_opts += " -D WEIGHT_TILE_SIZE=" + std::to_string(TILE_M * TILE_K);
+        //                                 compile_opts += " -D TILE_M_x_GLOBAL_M_SIZE=" + std::to_string(TILE_M * WG_M * WI_M);
+        //                                 compile_opts += " -D TILE_N_x_GLOBAL_N_SIZE=" + std::to_string(TILE_N * WG_N * WI_N);
+        //                                 compile_opts += " -D GLOBAL_N_SIZE=" + std::to_string(WG_N * WI_N);
+        //                                 compile_opts += " -D GLOBAL_M_SIZE=" + std::to_string(WG_M * WI_M);
+        //                                 compile_opts += " -D GLOBAL_K_SIZE=" + std::to_string(WI_K);
 
-                                        program_general_gemm = build_program_from_source(context, device, OpenCLKernels::GENERAL_GEMM_KERNEL_SOURCE.c_str(), compile_opts);
-                                        kernel_general_gemm = clCreateKernel(program_general_gemm, "kernel_mul_mat_q4_0_f32", &err);
-                                        if (err != CL_SUCCESS) {
-                                            std::cerr << "커널 생성 실패" << std::endl;
-                                            return;
-                                        }
+        //                                 program_general_gemm = build_program_from_source(context, device, OpenCLKernels::GENERAL_GEMM_KERNEL_SOURCE.c_str(), compile_opts);
+        //                                 kernel_general_gemm = clCreateKernel(program_general_gemm, "kernel_mul_mat_q4_0_f32", &err);
+        //                                 if (err != CL_SUCCESS) {
+        //                                     std::cerr << "커널 생성 실패" << std::endl;
+        //                                     return;
+        //                                 }
 
-                                        size_t global_size[3] = {WI_K, WG_N*WI_N, WG_M*WI_M};
-                                        size_t local_size[3] = {WI_K, WI_N, WI_M};
-                                        N_padding = (N + TILE_M - 1) / TILE_M * TILE_M;
-                                        N_no_padding = N;
+        //                                 size_t global_size[3] = {WI_K, WG_N*WI_N, WG_M*WI_M};
+        //                                 size_t local_size[3] = {WI_K, WI_N, WI_M};
+        //                                 N_padding = (N + TILE_M - 1) / TILE_M * TILE_M;
+        //                                 N_no_padding = N;
 
-                                        double time = runKernel(kernel_general_gemm, global_size, local_size);
-                                        double gflops = (2.0 * M * N * K) / (time * 1e6);
-                                        if (gflops > best_gflops) {
-                                            best_gflops = gflops;
-                                            best_time = time;
-                                        }
-                                        std::cout << "Time: " << time << " ms, GFLOPS: " << gflops << std::endl;
-                                        std::cout << "Best Time: " << best_time << " ms, Best GFLOPS: " << best_gflops << std::endl;
+        //                                 double time = runKernel(kernel_general_gemm, global_size, local_size);
+        //                                 double gflops = (2.0 * M * N * K) / (time * 1e6);
+        //                                 if (gflops > best_gflops) {
+        //                                     best_gflops = gflops;
+        //                                     best_time = time;
+        //                                 }
+        //                                 std::cout << "Time: " << time << " ms, GFLOPS: " << gflops << std::endl;
+        //                                 std::cout << "Best Time: " << best_time << " ms, Best GFLOPS: " << best_gflops << std::endl;
 
-                                        clReleaseKernel(kernel_general_gemm);
-                                        clReleaseProgram(program_general_gemm);
-                                    }
-                                }
-                            }
+        //                                 clReleaseKernel(kernel_general_gemm);
+        //                                 clReleaseProgram(program_general_gemm);
+        //                             }
+        //                         }
+        //                     }
+        //                 }
+        //             }
+        //         }
+        //     }
+        // }
+        size_t TILE_N = 4;
+        size_t TILE_M = 8;
+        size_t TILE_K = 4;
+        for (size_t DIM_N = 0; DIM_N < 2; DIM_N++) {
+            size_t DIM_M = (DIM_N == 0) ? 1 : 0;
+            size_t DIM_K = 2;
+            for (size_t WI_N = 1; WI_N <= (N+TILE_N-1) / TILE_N; WI_N *= 2) {
+                size_t WG_N = (N+TILE_N-1) / TILE_N / WI_N;
+                for (size_t WI_M = 1; WI_M <= M / TILE_M; WI_M *= 2) {
+                    size_t WG_M = M / TILE_M / WI_M;
+                    for (size_t WI_K = 1; WI_K <= 64; WI_K *= 2) {
+                        size_t num_thread_per_group = WI_N * WI_M * WI_K;
+                        size_t total_thread = num_thread_per_group * WG_N * WG_M;
+                        if (total_thread < 1024 || num_thread_per_group < 64 || num_thread_per_group >= 1024) {
+                            continue;
                         }
+                        // count += 1;
+                        // continue;
+                        std::cout << "TILE_N(" << DIM_N << "): " << TILE_N << ", TILE_M(" << DIM_M << "): " << TILE_M << ", TILE_K(" << DIM_K << "): " << TILE_K << ", WG_N: " << WG_N << ", WG_M: " << WG_M << ", WI_N: " << WI_N << ", WI_M: " << WI_M << ", WI_K: " << WI_K << std::endl;
+
+                        std::string compile_opts = "-cl-mad-enable -cl-unsafe-math-optimizations -cl-finite-math-only -cl-fast-relaxed-math ";
+                        compile_opts += " -D TILE_N=" + std::to_string(TILE_N);
+                        compile_opts += " -D TILE_M=" + std::to_string(TILE_M);
+                        compile_opts += " -D TILE_K=" + std::to_string(TILE_K);
+                        compile_opts += " -D WG_N=" + std::to_string(WG_N);
+                        compile_opts += " -D WG_M=" + std::to_string(WG_M);
+                        compile_opts += " -D WI_N=" + std::to_string(WI_N);
+                        compile_opts += " -D WI_M=" + std::to_string(WI_M);
+                        compile_opts += " -D WI_K=" + std::to_string(WI_K);
+                        compile_opts += " -D DIM_N=" + std::to_string(DIM_N);
+                        compile_opts += " -D DIM_M=" + std::to_string(DIM_M);
+                        compile_opts += " -D DIM_K=" + std::to_string(DIM_K);
+                        // compile_opts += " -D M=" + std::to_string(M);
+                        // compile_opts += " -D N=" + std::to_string(N);
+                        // compile_opts += " -D K=" + std::to_string(K);
+                        // compile_opts += " -D WEIGHT_TILE_SIZE=" + std::to_string(TILE_M * TILE_K);
+                        // compile_opts += " -D TILE_M_x_GLOBAL_M_SIZE=" + std::to_string(TILE_M * WG_M * WI_M);
+                        // compile_opts += " -D TILE_N_x_GLOBAL_N_SIZE=" + std::to_string(TILE_N * WG_N * WI_N);
+                        // compile_opts += " -D GLOBAL_N_SIZE=" + std::to_string(WG_N * WI_N);
+                        // compile_opts += " -D GLOBAL_M_SIZE=" + std::to_string(WG_M * WI_M);
+                        // compile_opts += " -D GLOBAL_K_SIZE=" + std::to_string(WI_K);
+
+                        compile_opts += " -D WGS=" + std::to_string(WI_K * WI_M * WI_N);
+
+                        program_general_gemm = build_program_from_source(context, device, OpenCLKernels::SPLITK_GEMM_KERNEL_SOURCE.c_str(), compile_opts);
+                        kernel_general_gemm = clCreateKernel(program_general_gemm, "kernel_gemv_conv_c8_buf", &err);
+                        if (err != CL_SUCCESS) {
+                            std::cerr << "커널 생성 실패" << std::endl;
+                            return;
+                        }
+
+                        size_t global_size[3] = {WG_N*WI_N, WG_M*WI_M, WI_K};
+                        size_t local_size[3] = {WI_N, WI_M, WI_K};
+                        if (DIM_N == 1) {
+                            global_size[0] = WG_M*WI_M;
+                            global_size[1] = WG_N*WI_N;
+                            local_size[0] = WI_M;
+                            local_size[1] = WI_N;
+                        }
+                        N_padding = (N + TILE_M - 1) / TILE_M * TILE_M;
+                        N_no_padding = N;
+
+                        double time = runKernel(kernel_general_gemm, global_size, local_size);
+                        double gflops = (2.0 * M * N * K) / (time * 1e6);
+                        if (gflops > best_gflops) {
+                            best_gflops = gflops;
+                            best_time = time;
+                        }
+                        std::cout << "Time: " << time << " ms, GFLOPS: " << gflops << std::endl;
+                        std::cout << "Best Time: " << best_time << " ms, Best GFLOPS: " << best_gflops << std::endl;
+
+                        clReleaseKernel(kernel_general_gemm);
+                        clReleaseProgram(program_general_gemm);
                     }
                 }
             }
-        }   
+        }
         std::cout << "Total count: " << count << std::endl;
         
         // std::cout << "최대 워크 그룹 크기: " << max_work_group_size << std::endl;
